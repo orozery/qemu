@@ -41,6 +41,7 @@
 #define BLOCK_OPT_SIZE              "size"
 #define BLOCK_OPT_ENCRYPT           "encryption"
 #define BLOCK_OPT_ENCRYPT_FORMAT    "encrypt.format"
+#define BLOCK_OPT_ENCRYPT_HDR_LEN   "encryption_header_length"
 #define BLOCK_OPT_COMPAT6           "compat6"
 #define BLOCK_OPT_HWVERSION         "hwversion"
 #define BLOCK_OPT_BACKING_FILE      "backing_file"
@@ -753,6 +754,13 @@ struct BlockDriver {
         Error **errp);
     int coroutine_fn (*bdrv_co_remove_persistent_dirty_bitmap)(
         BlockDriverState *bs, const char *name, Error **errp);
+
+    int (*bdrv_crypto_header_read)(BlockDriverState *bs, int *format,
+                                   uint8_t **header, size_t *header_len,
+                                   Error **errp);
+    int (*bdrv_crypto_header_write)(BlockDriverState *bs, int format,
+                                    const uint8_t *header, size_t header_len,
+                                    uint64_t data_len, Error **errp);
 };
 
 static inline bool block_driver_can_compress(BlockDriver *drv)

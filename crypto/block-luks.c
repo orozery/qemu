@@ -1183,7 +1183,15 @@ qcrypto_block_luks_open(QCryptoBlock *block,
     g_autofree uint8_t *masterkey = NULL;
     g_autofree char *password = NULL;
 
-    if (!(flags & QCRYPTO_BLOCK_OPEN_NO_IO)) {
+    if ((flags & QCRYPTO_BLOCK_OPEN_CIPHERTEXT) &&
+        (flags & QCRYPTO_BLOCK_OPEN_RDWR)) {
+        /* current header is expected to be overwritten */
+        return 0;
+    }
+
+    bool no_decrypt = ((flags & QCRYPTO_BLOCK_OPEN_NO_IO) ||
+                       (flags & QCRYPTO_BLOCK_OPEN_CIPHERTEXT));
+    if (!no_decrypt) {
         if (!options->u.luks.key_secret) {
             error_setg(errp, "Parameter '%skey-secret' is required for cipher",
                        optprefix ? optprefix : "");
@@ -1212,7 +1220,7 @@ qcrypto_block_luks_open(QCryptoBlock *block,
         goto fail;
     }
 
-    if (!(flags & QCRYPTO_BLOCK_OPEN_NO_IO)) {
+    if (!no_decrypt) {
         /* Try to find which key slot our password is valid for
          * and unlock the master key from that slot.
          */

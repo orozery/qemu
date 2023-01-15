@@ -325,6 +325,12 @@ uint64_t qcrypto_block_get_payload_offset(QCryptoBlock *block)
     return block->payload_offset;
 }
 
+void qcrypto_block_set_payload_offset(QCryptoBlock *block,
+                                      uint64_t payload_offset)
+{
+    block->payload_offset = payload_offset;
+}
+
 
 uint64_t qcrypto_block_get_sector_size(QCryptoBlock *block)
 {

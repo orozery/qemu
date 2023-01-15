@@ -65,7 +65,9 @@ bool qcrypto_block_has_format(QCryptoBlockFormat format,
                               size_t buflen);
 
 typedef enum {
-    QCRYPTO_BLOCK_OPEN_NO_IO = (1 << 0),
+    QCRYPTO_BLOCK_OPEN_NO_IO      = (1 << 0),
+    QCRYPTO_BLOCK_OPEN_CIPHERTEXT = (1 << 1),
+    QCRYPTO_BLOCK_OPEN_RDWR       = (1 << 2),
 } QCryptoBlockOpenFlags;
 
 /**
@@ -285,6 +287,16 @@ QCryptoHashAlgorithm qcrypto_block_get_kdf_hash(QCryptoBlock *block);
  * Returns: the payload offset in bytes
  */
 uint64_t qcrypto_block_get_payload_offset(QCryptoBlock *block);
+
+/**
+ * qcrypto_block_set_payload_offset:
+ * @block: the block encryption object
+ * @payload_offset: the new payload offset
+ *
+ * Sets the value of the payload offset, in bytes.
+ */
+void qcrypto_block_set_payload_offset(QCryptoBlock *block,
+                                      uint64_t payload_offset);
 
 /**
  * qcrypto_block_get_sector_size:

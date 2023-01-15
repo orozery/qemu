@@ -316,6 +316,9 @@ static int qcow2_read_extensions(BlockDriverState *bs, uint64_t start_offset,
             if (flags & BDRV_O_NO_IO) {
                 cflags |= QCRYPTO_BLOCK_OPEN_NO_IO;
             }
+            if (flags & BDRV_O_CIPHERTEXT) {
+                cflags |= QCRYPTO_BLOCK_OPEN_CIPHERTEXT;
+            }
             s->crypto = qcrypto_block_open(s->crypto_opts, "encrypt.",
                                            qcow2_crypto_hdr_read_func,
                                            bs, cflags, QCOW2_MAX_THREADS, errp);
@@ -2297,7 +2300,7 @@ static coroutine_fn int qcow2_co_preadv_task(BlockDriverState *bs,
                                           offset, bytes, qiov, qiov_offset);
 
     case QCOW2_SUBCLUSTER_NORMAL:
-        if (bs->encrypted) {
+        if (bs->encrypted && !(bs->open_flags & BDRV_O_CIPHERTEXT)) {
             return qcow2_co_preadv_encrypted(bs, host_offset,
                                              offset, bytes, qiov, qiov_offset);
         }
@@ -2542,7 +2545,7 @@ static coroutine_fn int qcow2_co_pwritev_task(BlockDriverState *bs,
     void *crypt_buf = NULL;
     QEMUIOVector encrypted_qiov;
 
-    if (bs->encrypted) {
+    if (bs->encrypted && !(bs->open_flags & BDRV_O_CIPHERTEXT)) {
         assert(s->crypto);
         assert(bytes <= QCOW_MAX_CRYPT_CLUSTERS * s->cluster_size);
         crypt_buf = qemu_try_blockalign(bs->file->bs, bytes);
@@ -2633,7 +2636,7 @@ static coroutine_fn int qcow2_co_pwritev_part(
         trace_qcow2_writev_start_part(qemu_coroutine_self());
         offset_in_cluster = offset_into_cluster(s, offset);
         cur_bytes = MIN(bytes, INT_MAX);
-        if (bs->encrypted) {
+        if (bs->encrypted && !(bs->open_flags & BDRV_O_CIPHERTEXT)) {
             cur_bytes = MIN(cur_bytes,
                             QCOW_MAX_CRYPT_CLUSTERS * s->cluster_size
                             - offset_in_cluster);
@@ -3866,6 +3869,14 @@ static int coroutine_fn qcow2_co_create_opts(BlockDriver *drv,
     };
 
     if (!qdict_rename_keys(qdict, opt_renames, errp)) {
+        ret = -EINVAL;
+        goto finish;
+    }
+
+    val = qdict_get_try_str(qdict, BLOCK_OPT_ENCRYPT_FORMAT);
+    if (val && qemu_opt_get_size_del(opts, BLOCK_OPT_ENCRYPT_HDR_LEN, 0)) {
+        error_setg(errp, "Encryption format expected to be implicit "
+                         "and should not be explicitly specified");
         ret = -EINVAL;
         goto finish;
     }
@@ -5923,6 +5934,72 @@ void qcow2_signal_corruption(BlockDriverState *bs, bool fatal, int64_t offset,
     s->signaled_corruption = true;
 }
 
+static int qcow2_crypto_header_read(BlockDriverState *bs, int *format,
+                                    uint8_t **header, size_t *header_len,
+                                    Error **errp)
+{
+    BDRVQcow2State *s = bs->opaque;
+    uint64_t payload_offset;
+    int ret;
+
+    if (s->crypt_method_header != QCOW_CRYPT_LUKS) {
+        return -EINVAL;
+    }
+
+    payload_offset = qcrypto_block_get_payload_offset(s->crypto);
+
+    *header = g_new0(uint8_t, payload_offset);
+    ret = qcow2_crypto_hdr_read_func(s->crypto, 0, *header, payload_offset, bs,
+                                     errp);
+    if (ret < 0) {
+        free(*header);
+        return -1;
+    }
+
+    *format = Q_CRYPTO_BLOCK_FORMAT_LUKS;
+    *header_len = payload_offset;
+    return 0;
+}
+
+static int qcow2_crypto_header_write(BlockDriverState *bs, int format,
+                                     const uint8_t *header, size_t header_len,
+                                     uint64_t data_len, Error **errp)
+{
+    BDRVQcow2State *s = bs->opaque;
+    int ret;
+
+    assert(bs->open_flags & BDRV_O_CIPHERTEXT);
+
+    if (format != Q_CRYPTO_BLOCK_FORMAT_LUKS) {
+        return -ENOTSUP;
+    }
+    if ((bs->total_sectors * BDRV_SECTOR_SIZE) < data_len) {
+        return -ENOSPC;
+    }
+    if (s->crypt_method_header != QCOW_CRYPT_NONE) {
+        return -EINVAL;
+    }
+
+    ret = qcow2_crypto_hdr_init_func(s->crypto, header_len, bs, errp);
+    if (ret < 0) {
+        return -1;
+    }
+
+    ret = qcow2_crypto_hdr_write_func(s->crypto, 0, header, header_len, bs,
+                                      errp);
+    if (ret < 0) {
+        return -1;
+    }
+
+    s->crypt_method_header = QCOW_CRYPT_LUKS;
+    ret = qcow2_update_header(bs);
+    if (ret < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
 #define QCOW_COMMON_OPTIONS                                         \
     {                                                               \
         .name = BLOCK_OPT_SIZE,                                     \
@@ -5982,6 +6059,12 @@ static QemuOptsList qcow2_create_opts = {
             .name = BLOCK_OPT_ENCRYPT_FORMAT,                           \
             .type = QEMU_OPT_STRING,                                    \
             .help = "Encrypt the image, format choices: 'aes', 'luks'", \
+        },                                                              \
+        {                                                               \
+            .name = BLOCK_OPT_ENCRYPT_HDR_LEN,                          \
+            .type = QEMU_OPT_SIZE,                                    \
+            .help = "Length of an encryption header that will be "
+                    "manually written after format creation. ",         \
         },                                                              \
         BLOCK_CRYPTO_OPT_DEF_KEY_SECRET("encrypt.",                     \
             "ID of secret providing qcow AES key or LUKS passphrase"),  \
@@ -6106,6 +6189,9 @@ BlockDriver bdrv_qcow2 = {
     .bdrv_co_can_store_new_dirty_bitmap = qcow2_co_can_store_new_dirty_bitmap,
     .bdrv_co_remove_persistent_dirty_bitmap =
             qcow2_co_remove_persistent_dirty_bitmap,
+
+    .bdrv_crypto_header_read = qcow2_crypto_header_read,
+    .bdrv_crypto_header_write = qcow2_crypto_header_write,
 };
 
 static void bdrv_qcow2_init(void)

@@ -174,6 +174,12 @@ static QemuOptsList block_crypto_create_opts_luks = {
             .type = QEMU_OPT_SIZE,
             .help = "Virtual disk size"
         },
+        {
+            .name = BLOCK_OPT_ENCRYPT_HDR_LEN,
+            .type = QEMU_OPT_SIZE,
+            .help = "Length of an encryption header that will be "
+                    "manually written after format creation. ",
+        },
         BLOCK_CRYPTO_OPT_DEF_LUKS_KEY_SECRET(""),
         BLOCK_CRYPTO_OPT_DEF_LUKS_CIPHER_ALG(""),
         BLOCK_CRYPTO_OPT_DEF_LUKS_CIPHER_MODE(""),
@@ -292,6 +298,12 @@ static int block_crypto_open_generic(QCryptoBlockFormat format,
     if (flags & BDRV_O_NO_IO) {
         cflags |= QCRYPTO_BLOCK_OPEN_NO_IO;
     }
+    if (flags & BDRV_O_CIPHERTEXT) {
+        cflags |= QCRYPTO_BLOCK_OPEN_CIPHERTEXT;
+    }
+    if (flags & BDRV_O_RDWR) {
+        cflags |= QCRYPTO_BLOCK_OPEN_RDWR;
+    }
     crypto->block = qcrypto_block_open(open_opts, NULL,
                                        block_crypto_read_func,
                                        bs,
@@ -316,6 +328,7 @@ static int block_crypto_open_generic(QCryptoBlockFormat format,
 
 static int block_crypto_co_create_generic(BlockDriverState *bs,
                                           int64_t size,
+                                          int64_t header_length,
                                           QCryptoBlockCreateOptions *opts,
                                           PreallocMode prealloc,
                                           Error **errp)
@@ -342,15 +355,24 @@ static int block_crypto_co_create_generic(BlockDriverState *bs,
         .prealloc = prealloc,
     };
 
-    crypto = qcrypto_block_create(opts, NULL,
-                                  block_crypto_create_init_func,
-                                  block_crypto_create_write_func,
-                                  &data,
-                                  errp);
+    if (header_length > 0) {
+        /* header will be written later by bdrv_crypto_header_write */
+        ret = block_crypto_create_init_func(NULL, header_length, &data, errp);
+        if (ret < 0) {
+            ret = -EIO;
+            goto cleanup;
+        }
+    } else {
+        crypto = qcrypto_block_create(opts, NULL,
+                                      block_crypto_create_init_func,
+                                      block_crypto_create_write_func,
+                                      &data,
+                                      errp);
 
-    if (!crypto) {
-        ret = -EIO;
-        goto cleanup;
+        if (!crypto) {
+            ret = -EIO;
+            goto cleanup;
+        }
     }
 
     ret = 0;
@@ -412,6 +434,12 @@ block_crypto_co_preadv(BlockDriverState *bs, int64_t offset, int64_t bytes,
     uint64_t payload_offset = qcrypto_block_get_payload_offset(crypto->block);
 
     assert(payload_offset < INT64_MAX);
+
+    if (bs->open_flags & BDRV_O_CIPHERTEXT) {
+        return bdrv_co_preadv(bs->file, payload_offset + offset, bytes, qiov,
+                              0);
+    }
+
     assert(QEMU_IS_ALIGNED(offset, sector_size));
     assert(QEMU_IS_ALIGNED(bytes, sector_size));
 
@@ -473,11 +501,17 @@ block_crypto_co_pwritev(BlockDriverState *bs, int64_t offset, int64_t bytes,
     uint64_t sector_size = qcrypto_block_get_sector_size(crypto->block);
     uint64_t payload_offset = qcrypto_block_get_payload_offset(crypto->block);
 
-    flags &= ~BDRV_REQ_REGISTERED_BUF;
-
     assert(payload_offset < INT64_MAX);
+
+    if (bs->open_flags & BDRV_O_CIPHERTEXT) {
+        return bdrv_co_pwritev(bs->file, payload_offset + offset, bytes, qiov,
+                               flags);
+    }
+
     assert(QEMU_IS_ALIGNED(offset, sector_size));
     assert(QEMU_IS_ALIGNED(bytes, sector_size));
+
+    flags &= ~BDRV_REQ_REGISTERED_BUF;
 
     qemu_iovec_init(&hd_qiov, qiov->niov);
 
@@ -527,6 +561,9 @@ static void block_crypto_refresh_limits(BlockDriverState *bs, Error **errp)
 {
     BlockCrypto *crypto = bs->opaque;
     uint64_t sector_size = qcrypto_block_get_sector_size(crypto->block);
+    if (bs->open_flags & BDRV_O_CIPHERTEXT) {
+        return;
+    }
     bs->bl.request_alignment = sector_size; /* No sub-sector I/O */
 }
 
@@ -653,7 +690,7 @@ block_crypto_co_create_luks(BlockdevCreateOptions *create_options, Error **errp)
         preallocation = luks_opts->preallocation;
     }
 
-    ret = block_crypto_co_create_generic(bs, luks_opts->size, &create_opts,
+    ret = block_crypto_co_create_generic(bs, luks_opts->size, 0, &create_opts,
                                          preallocation, errp);
     if (ret < 0) {
         goto fail;
@@ -676,11 +713,13 @@ static int coroutine_fn block_crypto_co_create_opts_luks(BlockDriver *drv,
     PreallocMode prealloc;
     char *buf = NULL;
     int64_t size;
+    int64_t header_length;
     int ret;
     Error *local_err = NULL;
 
     /* Parse options */
     size = qemu_opt_get_size_del(opts, BLOCK_OPT_SIZE, 0);
+    header_length = qemu_opt_get_size_del(opts, BLOCK_OPT_ENCRYPT_HDR_LEN, 0);
 
     buf = qemu_opt_get_del(opts, BLOCK_OPT_PREALLOC);
     prealloc = qapi_enum_parse(&PreallocMode_lookup, buf,
@@ -716,7 +755,8 @@ static int coroutine_fn block_crypto_co_create_opts_luks(BlockDriver *drv,
     }
 
     /* Create format layer */
-    ret = block_crypto_co_create_generic(bs, size, create_opts, prealloc, errp);
+    ret = block_crypto_co_create_generic(bs, size, header_length, create_opts,
+                                         prealloc, errp);
     if (ret < 0) {
         goto fail;
     }
@@ -929,6 +969,59 @@ block_crypto_child_perms(BlockDriverState *bs, BdrvChild *c,
     }
 }
 
+static int block_crypto_header_read(BlockDriverState *bs, int *format,
+                                    uint8_t **header, size_t *header_len,
+                                    Error **errp)
+{
+    BlockCrypto *crypto = bs->opaque;
+    uint64_t payload_offset;
+    int ret;
+
+    if (!crypto->block) {
+        error_setg(errp, "Missing encryption header");
+        return -EINVAL;
+    }
+
+    payload_offset = qcrypto_block_get_payload_offset(crypto->block);
+
+    *header = g_new0(uint8_t, payload_offset);
+    ret = block_crypto_read_func(crypto->block, 0, *header, payload_offset, bs,
+                                 errp);
+    if (ret < 0) {
+        free(*header);
+        return -1;
+    }
+
+    *format = Q_CRYPTO_BLOCK_FORMAT_LUKS;
+    *header_len = payload_offset;
+    return 0;
+}
+
+static int block_crypto_header_write(BlockDriverState *bs, int format,
+                                     const uint8_t *header, size_t header_len,
+                                     uint64_t data_len, Error **errp)
+{
+    BlockCrypto *crypto = bs->opaque;
+    int ret;
+
+    assert(bs->open_flags & BDRV_O_CIPHERTEXT);
+
+    if (format != Q_CRYPTO_BLOCK_FORMAT_LUKS) {
+        return -ENOTSUP;
+    }
+    if (bdrv_getlength(bs->file->bs) < header_len + data_len) {
+        return -ENOSPC;
+    }
+
+    ret = block_crypto_write_func(crypto->block, 0, header, header_len, bs,
+                                  errp);
+    if (ret < 0) {
+        return -1;
+    }
+
+    qcrypto_block_set_payload_offset(crypto->block, header_len);
+    return 0;
+}
 
 static const char *const block_crypto_strong_runtime_opts[] = {
     BLOCK_CRYPTO_OPT_LUKS_KEY_SECRET,
@@ -961,6 +1054,8 @@ static BlockDriver bdrv_crypto_luks = {
     .bdrv_co_amend      = block_crypto_co_amend_luks,
     .bdrv_amend_pre_run = block_crypto_amend_prepare,
     .bdrv_amend_clean   = block_crypto_amend_cleanup,
+    .bdrv_crypto_header_read = block_crypto_header_read,
+    .bdrv_crypto_header_write = block_crypto_header_write,
 
     .is_format          = true,
 

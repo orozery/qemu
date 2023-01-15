@@ -85,6 +85,7 @@ enum {
     OPTION_BITMAPS = 275,
     OPTION_FORCE = 276,
     OPTION_SKIP_BROKEN = 277,
+    OPTION_CIPHERTEXT = 278,
 };
 
 typedef enum OutputFormat {
@@ -2224,6 +2225,10 @@ static int img_convert(int argc, char **argv)
     bool explict_min_sparse = false;
     bool bitmaps = false;
     bool skip_broken = false;
+    bool ciphertext = false;
+    int encryption_format = -1;
+    g_autofree uint8_t *encryption_header = NULL;
+    size_t encryption_header_len = 0;
     int64_t rate_limit = 0;
 
     ImgConvertState s = (ImgConvertState) {
@@ -2246,6 +2251,7 @@ static int img_convert(int argc, char **argv)
             {"target-is-zero", no_argument, 0, OPTION_TARGET_IS_ZERO},
             {"bitmaps", no_argument, 0, OPTION_BITMAPS},
             {"skip-broken-bitmaps", no_argument, 0, OPTION_SKIP_BROKEN},
+            {"ciphertext", no_argument, 0, OPTION_CIPHERTEXT},
             {0, 0, 0, 0}
         };
         c = getopt_long(argc, argv, ":hf:O:B:CcF:o:l:S:pt:T:qnm:WUr:",
@@ -2380,6 +2386,9 @@ static int img_convert(int argc, char **argv)
         case OPTION_SKIP_BROKEN:
             skip_broken = true;
             break;
+        case OPTION_CIPHERTEXT:
+            ciphertext = true;
+            break;
         }
     }
 
@@ -2440,11 +2449,20 @@ static int img_convert(int argc, char **argv)
         goto fail_getopt;
     }
 
+    if (ciphertext && s.src_num != 1) {
+        error_report("Copying ciphertext only possible with a single source");
+        goto fail_getopt;
+    }
+
     /* ret is still -EINVAL until here */
     ret = bdrv_parse_cache_mode(src_cache, &src_flags, &src_writethrough);
     if (ret < 0) {
         error_report("Invalid source cache option: %s", src_cache);
         goto fail_getopt;
+    }
+
+    if (ciphertext) {
+        src_flags |= BDRV_O_CIPHERTEXT;
     }
 
     /* Initialize before goto out */
@@ -2505,6 +2523,26 @@ static int img_convert(int argc, char **argv)
         goto out;
     }
 
+    if (ciphertext) {
+        BlockDriverState *src_bs = blk_bs(s.src[0]);
+        if (!src_bs->drv->bdrv_crypto_header_read) {
+            error_report("Format driver '%s' "
+                         "does not support reading encryption header",
+                         src_bs->drv->format_name);
+            ret = -1;
+            goto out;
+        }
+
+        ret = src_bs->drv->bdrv_crypto_header_read(src_bs, &encryption_format,
+                                                   &encryption_header,
+                                                   &encryption_header_len,
+                                                   &error_abort);
+        if (ret < 0) {
+            error_report("Cannot read source encryption header (%ld)", ret);
+            goto out;
+        }
+    }
+
     if (!skip_create) {
         /* Find driver and parse its options */
         drv = bdrv_find_format(out_fmt);
@@ -2553,6 +2591,11 @@ static int img_convert(int argc, char **argv)
         if (ret < 0) {
             goto out;
         }
+
+        if (ciphertext) {
+            qemu_opt_set_number(opts, BLOCK_OPT_ENCRYPT_HDR_LEN,
+                                encryption_header_len, &error_abort);
+        }
     }
 
     /* Get backing file name if -o backing_file was used */
@@ -2599,7 +2642,7 @@ static int img_convert(int argc, char **argv)
             goto out;
         }
 
-        if (encryption || encryptfmt) {
+        if (encryption || encryptfmt || ciphertext) {
             error_report("Compression and encryption not supported at "
                          "the same time");
             ret = -1;
@@ -2662,6 +2705,9 @@ static int img_convert(int argc, char **argv)
          * extend its size to align to the physical sector size.
          */
         flags |= BDRV_O_RESIZE;
+    }
+    if (ciphertext) {
+        flags |= BDRV_O_CIPHERTEXT;
     }
 
     if (skip_create) {
@@ -2746,6 +2792,25 @@ static int img_convert(int argc, char **argv)
     } else {
         s.compressed = s.compressed || bdi.needs_compressed_writes;
         s.cluster_sectors = bdi.cluster_size / BDRV_SECTOR_SIZE;
+    }
+
+    if (ciphertext) {
+        if (!out_bs->drv->bdrv_crypto_header_write) {
+            error_report("Format driver '%s' "
+                         "does not support writing encryption header",
+                         out_bs->drv->format_name);
+            ret = -1;
+            goto out;
+        }
+        ret = out_bs->drv->bdrv_crypto_header_write(
+                out_bs, encryption_format,
+                encryption_header, encryption_header_len,
+                blk_bs(s.src[0])->total_sectors * BDRV_SECTOR_SIZE,
+                &error_abort);
+        if (ret < 0) {
+            error_report("Cannot write target encryption header (%ld)", ret);
+            goto out;
+        }
     }
 
     if (rate_limit) {
